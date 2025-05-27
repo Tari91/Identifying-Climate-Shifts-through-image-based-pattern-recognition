@@ -1,0 +1,120 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms
+from PIL import Image
+import os
+from tqdm import tqdm
+
+# --- Parameters ---
+IMAGE_SIZE = 64
+NUM_IMAGES = 1000
+CLIMATE_SHIFT_RATIO = 0.5
+BATCH_SIZE = 32
+EPOCHS = 10
+DATA_DIR = "climate_images"
+
+# --- Create synthetic climate images ---
+def generate_climate_image(shift=False):
+    """Generate a synthetic 'climate' image."""
+    base = np.random.normal(0.5, 0.1, (IMAGE_SIZE, IMAGE_SIZE))
+    
+    if shift:
+        # Simulate a "climate shift" by adding a hotspot or sudden pattern
+        x, y = np.random.randint(10, 54, 2)
+        base[x-5:x+5, y-5:y+5] += np.random.normal(0.5, 0.1, (10, 10))
+    
+    base = np.clip(base, 0, 1)
+    return (base * 255).astype(np.uint8)
+
+# --- Save synthetic images ---
+os.makedirs(DATA_DIR + "/stable", exist_ok=True)
+os.makedirs(DATA_DIR + "/shift", exist_ok=True)
+
+for i in range(NUM_IMAGES):
+    shift = i < NUM_IMAGES * CLIMATE_SHIFT_RATIO
+    img = generate_climate_image(shift)
+    label = "shift" if shift else "stable"
+    plt.imsave(f"{DATA_DIR}/{label}/{i}.png", img, cmap='hot')
+
+# --- Custom Dataset ---
+class ClimateDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.data = []
+        self.labels = []
+        self.transform = transform
+        for label, idx in [("stable", 0), ("shift", 1)]:
+            folder = os.path.join(root_dir, label)
+            for file in os.listdir(folder):
+                self.data.append(os.path.join(folder, file))
+                self.labels.append(idx)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.data[idx]).convert("L")
+        if self.transform:
+            image = self.transform(image)
+        return image, self.labels[idx]
+
+# --- Data Transforms ---
+transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor()
+])
+
+dataset = ClimateDataset(DATA_DIR, transform=transform)
+train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+# --- Simple CNN Model ---
+class ClimateCNN(nn.Module):
+    def __init__(self):
+        super(ClimateCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32 * (IMAGE_SIZE // 4) * (IMAGE_SIZE // 4), 64),
+            nn.ReLU(),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        return self.classifier(x)
+
+# --- Training ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ClimateCNN().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0
+    correct = 0
+    for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        images, labels = images.to(device), torch.tensor(labels).to(device)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        preds = torch.argmax(outputs, dim=1)
+        correct += (preds == labels).sum().item()
+
+    accuracy = correct / len(dataset)
+    print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}, Accuracy: {accuracy:.4f}")
