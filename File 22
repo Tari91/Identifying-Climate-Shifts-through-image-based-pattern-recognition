@@ -1,301 +1,78 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
-from torch.utils.data import Dataset, DataLoader, random_split
-import torch.nn as nn
-import torch.optim as optim
-from torchvision import transforms
-from PIL import Image
-import os
-import shutil # For cleaning up directories
-from tqdm import tqdm
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 
-# --- Parameters ---
-# Size of the synthetic images (width and height)
-IMAGE_SIZE = 64
-# Total number of synthetic images to generate
-NUM_IMAGES = 2000
-# Ratio of images that will simulate a 'climate shift' (e.g., 0.5 means 50% shifted)
-CLIMATE_SHIFT_RATIO = 0.5
-# Batch size for training the neural network
-BATCH_SIZE = 32
-# Number of training epochs (full passes through the dataset)
-EPOCHS = 15
-# Directory to store the generated synthetic images
-DATA_DIR = "synthetic_climate_data"
-# Ratio for splitting data into training and validation sets
-TRAIN_VAL_SPLIT_RATIO = 0.8
+# 1. Generate synthetic climate images
+def generate_climate_image(climate_type, size=(64, 64)):
+    """Generates a synthetic image representing a specific climate pattern."""
+    img = np.zeros(size)
+    if climate_type == "el_nino":
+        x, y = np.meshgrid(np.linspace(-1, 1, size[0]), np.linspace(-1, 1, size[1]))
+        img = np.exp(-(x**2 + y**2)) + 0.1 * np.random.randn(*size)
+    elif climate_type == "la_nina":
+        img = np.sin(np.linspace(0, 10, size[0]))[:, None] * np.cos(np.linspace(0, 10, size[1])) + 0.1 * np.random.randn(*size)
+    else:  # neutral
+        img = 0.5 * np.random.randn(*size)
+    return (img - np.min(img)) / (np.max(img) - np.min(img))  # normalize
 
-# --- Create Synthetic Climate Images ---
-def generate_climate_image(shift=False):
-    """
-    Generates a synthetic grayscale 'climate' image.
-    
-    Args:
-        shift (bool): If True, a 'climate shift' (a hotspot) is added to the image.
-                      If False, a 'stable' climate pattern is generated.
-                      
-    Returns:
-        np.ndarray: A 2D numpy array representing the grayscale image,
-                    with pixel values ranging from 0 to 255 (uint8).
-    """
-    # Start with a base of random Gaussian noise, simulating natural variations
-    base = np.random.normal(0.5, 0.1, (IMAGE_SIZE, IMAGE_SIZE))
-    
-    if shift:
-        # Simulate a "climate shift" by adding a more pronounced hotspot
-        # Choose a random central point for the hotspot
-        x_center, y_center = np.random.randint(IMAGE_SIZE // 4, 3 * IMAGE_SIZE // 4, 2)
-        # Define the size of the hotspot
-        hotspot_size = IMAGE_SIZE // 8
-        
-        # Create a circular hotspot pattern
-        y, x = np.ogrid[-x_center:IMAGE_SIZE-x_center, -y_center:IMAGE_SIZE-y_center]
-        mask = x*x + y*y <= hotspot_size*hotspot_size
-        
-        # Add a strong signal to the hotspot area
-        base[mask] += np.random.normal(0.8, 0.1, base[mask].shape)
-    
-    # Clip values to ensure they are within a valid range [0, 1]
-    base = np.clip(base, 0, 1)
-    # Convert to 8-bit grayscale (0-255)
-    return (base * 255).astype(np.uint8)
+# 2. Create dataset
+def create_dataset(n_per_class=500):
+    classes = ['el_nino', 'la_nina', 'neutral']
+    X, y = [], []
+    for idx, cls in enumerate(classes):
+        for _ in range(n_per_class):
+            img = generate_climate_image(cls)
+            X.append(img)
+            y.append(idx)
+    return np.array(X), np.array(y)
 
-# --- Save Synthetic Images to Disk ---
-# Create directories for stable and shifted images if they don't exist
-os.makedirs(os.path.join(DATA_DIR, "stable"), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "shift"), exist_ok=True)
+X, y = create_dataset()
+X = X[..., np.newaxis]  # Add channel dimension
 
-print(f"Generating {NUM_IMAGES} synthetic climate images...")
-for i in tqdm(range(NUM_IMAGES), desc="Generating Images"):
-    # Determine if the current image should represent a shift
-    is_shift = i < NUM_IMAGES * CLIMATE_SHIFT_RATIO
-    img = generate_climate_image(is_shift)
-    
-    # Assign label and save to the corresponding directory
-    label_folder = "shift" if is_shift else "stable"
-    plt.imsave(os.path.join(DATA_DIR, label_folder, f"{i}.png"), img, cmap='hot')
-print("Image generation complete.")
+# 3. Split dataset
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# --- Custom Dataset Class ---
-class ClimateDataset(Dataset):
-    """
-    A custom PyTorch Dataset for loading synthetic climate images.
-    """
-    def __init__(self, root_dir, transform=None):
-        """
-        Initializes the dataset.
-        
-        Args:
-            root_dir (str): The root directory containing 'stable' and 'shift' subfolders.
-            transform (callable, optional): Optional transform to be applied on a sample.
-        """
-        self.data = []    # List to store image file paths
-        self.labels = []  # List to store corresponding numerical labels (0 for stable, 1 for shift)
-        self.transform = transform
-        
-        # Iterate through 'stable' and 'shift' subfolders
-        for label_name, label_idx in [("stable", 0), ("shift", 1)]:
-            folder_path = os.path.join(root_dir, label_name)
-            if not os.path.exists(folder_path):
-                print(f"Warning: Folder '{folder_path}' not found. Skipping.")
-                continue
-            
-            # Collect all image files and their labels
-            for file_name in os.listdir(folder_path):
-                if file_name.endswith(".png"): # Ensure only image files are processed
-                    self.data.append(os.path.join(folder_path, file_name))
-                    self.labels.append(label_idx)
-
-    def __len__(self):
-        """Returns the total number of samples in the dataset."""
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        """
-        Retrieves an image and its label by index.
-        
-        Args:
-            idx (int): The index of the sample to retrieve.
-            
-        Returns:
-            tuple: A tuple containing the transformed image tensor and its label.
-        """
-        # Open the image file and convert to grayscale ('L' mode)
-        image = Image.open(self.data[idx]).convert("L")
-        label = self.labels[idx]
-        
-        # Apply transformations if provided
-        if self.transform:
-            image = self.transform(image)
-        
-        # Return the image tensor and its label
-        return image, label
-
-# --- Data Transforms ---
-# Define transformations to apply to images: resize and convert to PyTorch tensor
-transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)), # Resize images to a consistent size
-    transforms.ToTensor()                        # Convert PIL Image to PyTorch Tensor (scales to [0, 1])
+# 4. Define CNN model
+model = Sequential([
+    Conv2D(32, (3, 3), activation='relu', input_shape=(64, 64, 1)),
+    MaxPooling2D(2, 2),
+    Conv2D(64, (3, 3), activation='relu'),
+    MaxPooling2D(2, 2),
+    Flatten(),
+    Dense(128, activation='relu'),
+    Dropout(0.5),
+    Dense(3, activation='softmax')
 ])
 
-# Initialize the custom dataset
-full_dataset = ClimateDataset(DATA_DIR, transform=transform)
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+model.summary()
 
-# --- Split Dataset into Training and Validation Sets ---
-train_size = int(TRAIN_VAL_SPLIT_RATIO * len(full_dataset))
-val_size = len(full_dataset) - train_size
-train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+# 5. Train model
+history = model.fit(X_train, y_train, epochs=10, validation_split=0.2)
 
-# Create DataLoaders for efficient batching and shuffling
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False) # No need to shuffle validation data
+# 6. Evaluate
+test_loss, test_acc = model.evaluate(X_test, y_test)
+print("Test Accuracy:", test_acc)
 
-print(f"Dataset loaded: {len(full_dataset)} images total.")
-print(f"Training set size: {len(train_dataset)} images.")
-print(f"Validation set size: {len(val_dataset)} images.")
+# Classification report
+y_pred = model.predict(X_test).argmax(axis=1)
+print(classification_report(y_test, y_pred, target_names=['el_nino', 'la_nina', 'neutral']))
 
+# 7. Plot sample predictions
+def show_sample_predictions(n=5):
+    plt.figure(figsize=(12, 3))
+    for i in range(n):
+        idx = np.random.randint(0, len(X_test))
+        pred_label = y_pred[idx]
+        true_label = y_test[idx]
+        plt.subplot(1, n, i+1)
+        plt.imshow(X_test[idx].squeeze(), cmap='viridis')
+        plt.title(f'True: {true_label}, Pred: {pred_label}')
+        plt.axis('off')
+    plt.tight_layout()
+    plt.show()
 
-# --- Simple CNN Model for Image Classification ---
-class ClimateCNN(nn.Module):
-    """
-    A simple Convolutional Neural Network for classifying climate images
-    into 'stable' or 'shift' categories.
-    """
-    def __init__(self):
-        super(ClimateCNN, self).__init__()
-        # Feature extraction layers
-        self.features = nn.Sequential(
-            # First convolutional block: 1 input channel (grayscale), 16 output channels
-            nn.Conv2d(1, 16, kernel_size=3, padding=1), # Output size: IMAGE_SIZE x IMAGE_SIZE
-            nn.ReLU(),                                 # Activation function
-            nn.MaxPool2d(2),                           # Max pooling (reduces size by 2x, e.g., 64->32)
-            
-            # Second convolutional block: 16 input channels, 32 output channels
-            nn.Conv2d(16, 32, kernel_size=3, padding=1), # Output size: IMAGE_SIZE/2 x IMAGE_SIZE/2
-            nn.ReLU(),                                 # Activation function
-            nn.MaxPool2d(2)                            # Max pooling (reduces size by 2x, e.g., 32->16)
-        )
-        
-        # Calculate the size of the flattened features after convolutional and pooling layers
-        # IMAGE_SIZE // 4 because two MaxPool2d layers each reduce dimensions by 2
-        flattened_size = 32 * (IMAGE_SIZE // 4) * (IMAGE_SIZE // 4)
-        
-        # Classifier (fully connected) layers
-        self.classifier = nn.Sequential(
-            nn.Flatten(),                              # Flatten the 2D feature maps into a 1D vector
-            nn.Linear(flattened_size, 64),             # First fully connected layer
-            nn.ReLU(),                                 # Activation function
-            nn.Linear(64, 2)                           # Output layer: 2 classes (stable, shift)
-        )
-
-    def forward(self, x):
-        """
-        Defines the forward pass of the network.
-        
-        Args:
-            x (torch.Tensor): Input tensor (image batch).
-            
-        Returns:
-            torch.Tensor: Output tensor (logits for each class).
-        """
-        x = self.features(x)     # Pass input through feature extraction layers
-        x = self.classifier(x)   # Pass features through classification layers
-        return x
-
-# --- Training and Evaluation Setup ---
-# Determine the device to use for training (GPU if available, otherwise CPU)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-# Instantiate the model and move it to the selected device
-model = ClimateCNN().to(device)
-# Define the loss function (CrossEntropyLoss is suitable for multi-class classification)
-criterion = nn.CrossEntropyLoss()
-# Define the optimizer (Adam is a popular choice)
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-# --- Training Loop ---
-print("\nStarting training...")
-for epoch in range(EPOCHS):
-    # Set model to training mode
-    model.train()
-    total_train_loss = 0
-    correct_train = 0
-    
-    # Iterate over batches in the training data
-    for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} (Train)"):
-        # Move images and labels to the specified device
-        images, labels = images.to(device), labels.to(device)
-        
-        # Forward pass: compute model outputs
-        outputs = model(images)
-        # Calculate the loss
-        loss = criterion(outputs, labels)
-        
-        # Backward pass and optimization
-        optimizer.zero_grad() # Clear previous gradients
-        loss.backward()       # Compute gradients
-        optimizer.step()      # Update model parameters
-        
-        total_train_loss += loss.item()
-        # Calculate training accuracy
-        preds = torch.argmax(outputs, dim=1)
-        correct_train += (preds == labels).sum().item()
-    
-    # Calculate average training loss and accuracy for the epoch
-    avg_train_loss = total_train_loss / len(train_loader)
-    train_accuracy = correct_train / len(train_dataset)
-    
-    # --- Validation Phase ---
-    model.eval() # Set model to evaluation mode (disables dropout, batchnorm updates)
-    total_val_loss = 0
-    correct_val = 0
-    
-    # Disable gradient calculations during validation
-    with torch.no_grad():
-        for images, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} (Val)  "):
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            
-            total_val_loss += loss.item()
-            # Calculate validation accuracy
-            preds = torch.argmax(outputs, dim=1)
-            correct_val += (preds == labels).sum().item()
-            
-    # Calculate average validation loss and accuracy for the epoch
-    avg_val_loss = total_val_loss / len(val_loader)
-    val_accuracy = correct_val / len(val_dataset)
-    
-    # Print epoch results
-    print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_train_loss:.4f}, Train Acc: {train_accuracy:.4f} | "
-          f"Val Loss: {avg_val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
-
-print("\nTraining complete.")
-
-# --- Final Evaluation (Optional, can be done on a separate test set) ---
-# For simplicity, we'll use the validation set as a proxy for final evaluation here.
-# In a real-world scenario, you'd have a separate, unseen test set.
-model.eval()
-final_correct = 0
-final_total = 0
-with torch.no_grad():
-    for images, labels in val_loader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        predictions = torch.argmax(outputs, dim=1)
-        final_total += labels.size(0)
-        final_correct += (predictions == labels).sum().item()
-
-final_accuracy = final_correct / final_total
-print(f"\nFinal Accuracy on Validation Set: {final_accuracy:.4f}")
-
-# --- Clean up generated image files and directory ---
-if os.path.exists(DATA_DIR):
-    try:
-        shutil.rmtree(DATA_DIR)
-        print(f"Cleaned up generated image directory: {DATA_DIR}")
-    except OSError as e:
-        print(f"Error removing directory {DATA_DIR}: {e}")
-
+show_sample_predictions()
